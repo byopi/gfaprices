@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: bot-divisas
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false          # se pone manualmente en el dashboard
+      - key: EXCHANGERATE_API_KEY
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false          # https://bot-divisas.onrender.com  (tu URL de Render)
+      - key: PORT
+        value: "8080"
+    healthCheckPath: /health
