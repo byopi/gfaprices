@@ -44,9 +44,9 @@ VEN_TZ       = pytz.timezone("America/Caracas")   # UTC-4
 WEBHOOK_PATH = f"/webhook/{TELEGRAM_TOKEN}"
 
 # ── Anti-flood ────────────────────────────────────────────────────────────────
-FLOOD_WINDOW   = 5 * 60   # ventana 5 minutos
+FLOOD_WINDOW   = 1 * 60   # ventana 5 minutos
 FLOOD_LIMIT    = 3        # máx. usos antes de bloquear
-FLOOD_BAN_SECS = 5 * 60   # duración del bloqueo
+FLOOD_BAN_SECS = 1 * 60   # duración del bloqueo
 
 _flood_log: dict = defaultdict(list)
 _flood_ban: dict = {}
