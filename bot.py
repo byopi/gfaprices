@@ -140,13 +140,41 @@ def fetch_exchangerate() -> dict:
 
 
 def fetch_bcv_rate() -> Optional[float]:
+    """
+    Tasa BCV usando pyDolarVenezuela v2.x.
+    API: Monitor(BCV, 'USD') → get_value_monitors('usd') → .price
+    Fallback: scraping directo de bcv.org.ve si la librería falla.
+    """
+    # Intento 1 — librería pyDolarVenezuela v2.x
     try:
-        from pydollarvenezuela import get_dollar
-        result = get_dollar("bcv")
+        from pyDolarVenezuela.pages import BCV
+        from pyDolarVenezuela import Monitor
+        monitor = Monitor(BCV, "USD")
+        result  = monitor.get_value_monitors("usd")
         if result and hasattr(result, "price"):
             return float(result.price)
+        if isinstance(result, dict):
+            return float(result.get("price") or result.get("value") or 0) or None
     except Exception as exc:
-        logger.warning(f"BCV error: {exc}")
+        logger.warning(f"pyDolarVenezuela BCV error: {exc}")
+
+    # Fallback — scraping directo bcv.org.ve
+    try:
+        resp = requests.get(
+            "http://www.bcv.org.ve/",
+            headers={**_SCRAPE_HEADERS, "Referer": "https://www.google.com/"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            div = soup.find(id="dolar") or soup.find("div", class_="col-sm-12 col-xs-12 strong")
+            if div:
+                m = re.search(r"(\d+[.,]\d+)", div.get_text())
+                if m:
+                    return float(m.group(1).replace(",", "."))
+    except Exception as exc:
+        logger.warning(f"BCV scraping fallback error: {exc}")
+
     return None
 
 
