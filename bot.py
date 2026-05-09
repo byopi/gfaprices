@@ -44,9 +44,9 @@ VEN_TZ       = pytz.timezone("America/Caracas")   # UTC-4
 WEBHOOK_PATH = f"/webhook/{TELEGRAM_TOKEN}"
 
 # ── Anti-flood ────────────────────────────────────────────────────────────────
-FLOOD_WINDOW   = 1 * 60   # ventana 5 minutos
+FLOOD_WINDOW   = 5 * 60   # ventana 5 minutos
 FLOOD_LIMIT    = 3        # máx. usos antes de bloquear
-FLOOD_BAN_SECS = 1 * 60   # duración del bloqueo
+FLOOD_BAN_SECS = 5 * 60   # duración del bloqueo
 
 _flood_log: dict = defaultdict(list)
 _flood_ban: dict = {}
@@ -60,7 +60,7 @@ cache: dict = {
     "official_buy" : None,    # ARS oficial compra
     "official_sell": None,    # ARS oficial venta
     "cup_bcc"      : None,    # CUP/USD  BCC Segmento III (oficial)
-    "cup_informal" : None,    # CUP/USD  elTOQUE (mercado negro)
+    "cup_informal" : None,    # CUP/USD  elTOQUE (mercado informal)
     "date"         : None,    # "YYYY-MM-DD"
 }
 
@@ -79,7 +79,7 @@ CURRENCY_META: dict[str, tuple] = {
     "uyu"  : ("UYU", "🇺🇾", "Peso Uruguayo"),
     "usd"  : ("USD", "🇺🇸", "Dólar Estadounidense"),
     "mxn"  : ("MXN", "🇲🇽", "Peso Mexicano"),
-    "cup"  : ("CUP", "🇨🇺", "Peso Cubano Oficial (BCC Seg. III)"),
+    "cup"  : ("CUP", "🇨🇺", "Peso Cubano (BCC Seg. III)"),
     "cupb" : ("CUP", "🇨🇺", "Peso Cubano Informal (elTOQUE)"),
     "eur"  : ("EUR", "🇪🇺", "Euro"),
     "gbp"  : ("GBP", "🇬🇧", "Libra Esterlina"),
@@ -103,7 +103,7 @@ REGIONS: dict[str, list] = {
     "🌎 Norte/Centro América": [
         ("usd",  "🇺🇸", "USD — Dólar Estadounidense"),
         ("mxn",  "🇲🇽", "MXN — Peso Mexicano"),
-        ("cup",  "🇨🇺", "CUP — Peso Cubano Oficial (BCC Seg. III)"),
+        ("cup",  "🇨🇺", "CUP — Peso Cubano (BCC Seg. III)"),
         ("cupb", "🇨🇺", "CUP — Peso Cubano Informal (elTOQUE)"),
     ],
     "🌍 Europa / Asia": [
@@ -244,75 +244,79 @@ def fetch_cup_bcc() -> Optional[float]:
 
 def fetch_cup_informal() -> Optional[float]:
     """
-    Tasa informal USD→CUP desde elTOQUE.
-    La página es Next.js con SSR: los datos van embebidos en __NEXT_DATA__ y en tablas HTML.
-    Se intentan 3 métodos de extracción en orden.
+    Scraping de https://eltoque.com/tasas-de-cambio-cuba/mercado-informal
+    La tabla en el HTML tiene exactamente este formato:
+      | 1 USD |  | 542.00 CUP+2 |
+    La página es Next.js con SSR — el HTML ya contiene los datos renderizados.
     """
-    urls = [
-        "https://eltoque.com/tasas-de-cambio-cuba",
-        "https://eltoque.com/tasas-de-cambio-cuba/mercado-informal",
-    ]
-    for url in urls:
-        try:
-            resp = requests.get(url, headers=_SCRAPE_HEADERS, timeout=20)
-            if resp.status_code != 200:
-                logger.warning(f"elTOQUE {url} → HTTP {resp.status_code}")
+    url = "https://eltoque.com/tasas-de-cambio-cuba/mercado-informal"
+    try:
+        resp = requests.get(url, headers=_SCRAPE_HEADERS, timeout=20)
+        if resp.status_code != 200:
+            logger.warning(f"elTOQUE mercado-informal → HTTP {resp.status_code}")
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # ── Método A: buscar en tablas HTML ──────────────────────────────────
+        # La tabla tiene filas: <td>1 USD</td><td></td><td>542.00 CUP+2</td>
+        for row in soup.find_all("tr"):
+            cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+            if not cells:
                 continue
+            # Buscar la celda que dice "1 USD"
+            if any(re.fullmatch(r"1\s*USD", c, re.I) for c in cells):
+                for cell in cells:
+                    # La celda del valor tiene formato "542.00 CUP+2" o "542.00 CUP"
+                    m = re.match(r"([\d]{3,4}(?:[.,]\d+)?)\s*CUP", cell, re.I)
+                    if m:
+                        val = float(m.group(1).replace(",", "."))
+                        if 200 < val < 3000:
+                            logger.info(f"elTOQUE USD informal (tabla): {val}")
+                            return val
 
-            soup = BeautifulSoup(resp.text, "html.parser")
+        # ── Método B: texto plano con el patrón exacto de la tabla ───────────
+        # El markdown renderizado tiene: "| 1 USD |  | 542.00 CUP+2 |"
+        text = soup.get_text(" ")
+        patterns = [
+            r"1\s+USD\s+[\d,. ]*?([\d]{3,4}(?:[.,]\d+)?)\s*CUP",
+            r"USD[^\d]{0,10}([\d]{3,4}(?:[.,]\d+)?)\s*CUP",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, re.I)
+            if m:
+                val = float(m.group(1).replace(",", "."))
+                if 200 < val < 3000:
+                    logger.info(f"elTOQUE USD informal (texto): {val}")
+                    return val
 
-            # ── Método A: JSON embebido __NEXT_DATA__ ─────────────────────────
-            next_data_tag = soup.find("script", id="__NEXT_DATA__")
-            if next_data_tag and next_data_tag.string:
-                try:
-                    jdata = json.loads(next_data_tag.string)
-                    jtext = json.dumps(jdata)
-                    # Buscar patrones como "USD":{"value":539.5} o similar
-                    for pattern in [
-                        r'"USD"\s*:\s*\{[^}]*?"value"\s*:\s*([\d.]+)',
-                        r'"currency"\s*:\s*"USD"[^}]*?"rate"\s*:\s*([\d.]+)',
-                        r'"USD"[^}]{0,60}"([\d]{3,4}(?:\.\d+)?)"',
-                    ]:
-                        m = re.search(pattern, jtext)
-                        if m:
-                            val = float(m.group(1))
-                            if 200 < val < 3000:
-                                logger.info(f"elTOQUE USD informal (NEXT_DATA): {val}")
-                                return val
-                except Exception:
-                    pass
+        # ── Método C: __NEXT_DATA__ JSON embebido ─────────────────────────────
+        nd = soup.find("script", id="__NEXT_DATA__")
+        if nd and nd.string:
+            jtext = nd.string
+            # Buscar cualquier número en rango 200-3000 cerca de "USD"
+            idx_usd = jtext.find('"USD"')
+            if idx_usd >= 0:
+                block = jtext[idx_usd:idx_usd + 300]
+                for pat in [
+                    r'"value"\s*:\s*([\d]{3,4}(?:\.\d+)?)',
+                    r'"price"\s*:\s*([\d]{3,4}(?:\.\d+)?)',
+                    r'"rate"\s*:\s*([\d]{3,4}(?:\.\d+)?)',
+                    r':\s*([\d]{3,4}(?:\.\d+)?)',
+                ]:
+                    m = re.search(pat, block)
+                    if m:
+                        val = float(m.group(1))
+                        if 200 < val < 3000:
+                            logger.info(f"elTOQUE USD informal (NEXT_DATA): {val}")
+                            return val
 
-            # ── Método B: tablas HTML ─────────────────────────────────────────
-            for row in soup.find_all("tr"):
-                cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-                for i, cell in enumerate(cells):
-                    if re.search(r'\b1\s*USD\b', cell, re.I):
-                        for j in range(i + 1, min(i + 4, len(cells))):
-                            m = re.search(r'(\d{3,4}(?:[.,]\d+)?)', cells[j])
-                            if m:
-                                val = float(m.group(1).replace(",", "."))
-                                if 200 < val < 3000:
-                                    logger.info(f"elTOQUE USD informal (tabla): {val}")
-                                    return val
+        logger.warning("elTOQUE: tabla encontrada pero no se pudo extraer USD/CUP")
+        return None
 
-            # ── Método C: texto plano ─────────────────────────────────────────
-            text = soup.get_text(" ")
-            for pattern in [
-                r'1\s+USD\b[^0-9]{0,40}(\d{3,4}(?:[.,]\d+)?)\s*CUP',
-                r'USD[^0-9]{0,20}(\d{3,4}(?:[.,]\d+)?)\s*CUP',
-            ]:
-                m = re.search(pattern, text, re.I)
-                if m:
-                    val = float(m.group(1).replace(",", "."))
-                    if 200 < val < 3000:
-                        logger.info(f"elTOQUE USD informal (texto): {val}")
-                        return val
-
-        except Exception as exc:
-            logger.warning(f"elTOQUE scraping error ({url}): {exc}")
-
-    logger.warning("elTOQUE: no se pudo obtener tasa informal USD/CUP")
-    return None
+    except Exception as exc:
+        logger.warning(f"elTOQUE scraping error: {exc}")
+        return None
 
 
 def refresh_cache():
@@ -322,7 +326,7 @@ def refresh_cache():
     rates       = fetch_exchangerate()
     bcv         = fetch_bcv_rate()
     blue        = fetch_bluelytics()
-    cup_bcc     = fetch_cup_bcc()
+    cup_bcc      = fetch_cup_bcc()
     cup_informal = fetch_cup_informal()
 
     cache.update({
@@ -338,7 +342,7 @@ def refresh_cache():
     })
     logger.info(
         f"✅ Caché listo — {today} — {len(rates)} monedas | "
-        f"BCC Seg.III={cup_bcc} | elTOQUE={cup_informal}"
+        f"BCC Seg.III={cup_bcc}"
     )
 
 
@@ -379,8 +383,6 @@ def get_usd_rate(cmd: str) -> Optional[float]:
         return float(s) if s is not None else None
     if cmd == "cup":
         return cache["cup_bcc"] or rates.get("CUP")
-    if cmd == "cupb":
-        return cache["cup_informal"]
     iso = CURRENCY_META[cmd][0]
     return rates.get(iso)
 
@@ -393,23 +395,63 @@ def esc(text: str) -> str:
     return text
 
 
-def eur_line() -> str:
-    """Devuelve la línea del Euro para añadir a cualquier mensaje de tasa."""
-    eur_rate = cache["rates"].get("EUR")
-    if eur_rate is None:
+def eur_line(cmd: str) -> str:
+    """
+    Línea del Euro expresada en la misma moneda del cmd.
+    Ej: /cop → 🇪🇺 Euro: 4,598.23   (pesos colombianos por 1 EUR)
+        /usd → 🇪🇺 Euro: 1.09        (USD por 1 EUR)
+        /eur → ""                    (no aplica)
+    """
+    if cmd == "eur":
         return ""
-    # EUR es cuántos EUR por 1 USD → para mostrar 1 USD en EUR = eur_rate
-    # Pero lo que queremos es: 1 EUR = X de la moneda consultada.
-    # Aquí simplemente mostramos el valor del Euro en USD para referencia cruzada:
-    # 1 EUR = 1/eur_rate USD → eur_rate es EUR por USD, así que 1 USD = eur_rate EUR
-    # Mostramos cuántos USD vale 1 EUR, que es 1/eur_rate
-    usd_per_eur = 1.0 / eur_rate if eur_rate else None
-    if usd_per_eur is None:
+
+    eur_rate_usd = cache["rates"].get("EUR")   # cuántos EUR = 1 USD (ej: 0.92)
+    if not eur_rate_usd:
         return ""
-    return f"🇪🇺 Euro: 🇺🇸 {esc(fmt(usd_per_eur))} USD"
 
+    usd_per_eur = 1.0 / eur_rate_usd   # cuántos USD = 1 EUR (ej: 1.087)
 
-# ── Anti-flood ─────────────────────────────────────────────────────────────────
+    if cmd == "usd":
+        return f"🇪🇺 Euro: {esc(fmt(usd_per_eur))}"
+
+    # CUP especiales
+    if cmd in ("cup", "cupb"):
+        if cmd == "cupb":
+            cup_rate = cache.get("cup_informal")
+        else:
+            cup_rate = cache.get("cup_bcc") or cache["rates"].get("CUP")
+        if cup_rate is None:
+            return ""
+        return f"🇪🇺 Euro: {esc(fmt(usd_per_eur * cup_rate))}"
+
+    # ARS/ARSB — usar venta
+    if cmd == "ars":
+        sell = cache.get("official_sell")
+        ars_rate = float(sell) if sell is not None else cache["rates"].get("ARS")
+        if ars_rate is None:
+            return ""
+        return f"🇪🇺 Euro: {esc(fmt(usd_per_eur * ars_rate))}"
+
+    if cmd == "arsb":
+        sell = cache.get("blue_sell")
+        if sell is None:
+            return ""
+        return f"🇪🇺 Euro: {esc(fmt(usd_per_eur * float(sell)))}"
+
+    # VES
+    if cmd == "ves":
+        ves_rate = cache.get("bcv_rate") or cache["rates"].get("VES")
+        if ves_rate is None:
+            return ""
+        return f"🇪🇺 Euro: {esc(fmt(usd_per_eur * ves_rate))}"
+
+    # Resto: usar ExchangeRate-API
+    iso = CURRENCY_META[cmd][0]
+    cmd_rate = cache["rates"].get(iso)
+    if cmd_rate is None:
+        return ""
+    return f"🇪🇺 Euro: {esc(fmt(usd_per_eur * cmd_rate))}"
+
 
 def check_flood(user_id: int, cmd: str) -> tuple[bool, int]:
     key = (user_id, cmd)
@@ -442,31 +484,48 @@ def build_rate_msg(cmd: str) -> str:
 
     # ── /ves — redirige a @bcvpricesbot ───────────────────────────────────────
     if cmd == "ves":
-        el = eur_line()
-        extra = f"\n{el}" if el else ""
+        el = eur_line("ves")
+        el_line = f"\n{el}" if el else ""
         return (
             f"*TASAS DEL DÍA*\n"
             f"📅 {esc(date_es())}\n"
             f"↪️💰{flag} _Bolívar Venezolano_\n"
             f"\n"
             f"🇻🇪 Las tasas BCV actualizadas las encontrarás en:\n"
-            f"👉 @bcvpricesbot\n"
-            f"{extra}\n"
+            f"👉 @bcvpricesbot"
+            f"{el_line}\n"
             f"\n"
             f"`[ℹ️]` _Para convertir 'VES' a otra moneda desde aquí, utilizar:_ "
             f"/convertir \\[valor\\] ves to \\[moneda destino\\]"
         )
 
-    # ── /usd — caso especial ──────────────────────────────────────────────────
-    if cmd == "usd":
-        el = eur_line()
+    # ── /eur ──────────────────────────────────────────────────────────────────
+    if cmd == "eur":
+        eur_rate_usd = cache["rates"].get("EUR")
+        usd_per_eur  = (1.0 / eur_rate_usd) if eur_rate_usd else None
+        rate_str = esc(fmt(usd_per_eur)) if usd_per_eur else "N/A"
         return (
             f"*TASAS DEL DÍA*\n"
             f"📅 {esc(date_es())}\n"
             f"↪️💰{flag} _{esc(name)}_\n"
             f"\n"
-            f"🇺🇸 1 USD \\= 1\\.00 USD\n"
-            f"{el}\n"
+            f"🇺🇸 Dólar: {rate_str}\n"
+            f"\n"
+            f"`[ℹ️]` _Para convertir 'EUR' a otra moneda, utilizar:_ "
+            f"/convertir \\[valor\\] eur to \\[moneda destino\\]"
+        )
+
+    # ── /usd ──────────────────────────────────────────────────────────────────
+    if cmd == "usd":
+        el = eur_line("usd")
+        el_line = f"\n{el}" if el else ""
+        return (
+            f"*TASAS DEL DÍA*\n"
+            f"📅 {esc(date_es())}\n"
+            f"↪️💰{flag} _{esc(name)}_\n"
+            f"\n"
+            f"🇺🇸 1 USD \\= 1\\.00"
+            f"{el_line}\n"
             f"\n"
             f"`[ℹ️]` _Para convertir 'USD' a otra moneda, utilizar:_ "
             f"/convertir \\[valor\\] usd to \\[moneda destino\\]"
@@ -474,23 +533,20 @@ def build_rate_msg(cmd: str) -> str:
 
     # ── /ars y /arsb — compra/venta ───────────────────────────────────────────
     if cmd in ("ars", "arsb"):
-        if cmd == "arsb":
-            buy, sell = cache["blue_buy"], cache["blue_sell"]
-        else:
-            buy, sell = cache["official_buy"], cache["official_sell"]
-
+        buy, sell = (cache["blue_buy"], cache["blue_sell"]) if cmd == "arsb" \
+                    else (cache["official_buy"], cache["official_sell"])
         b_str = esc(fmt(float(buy)))  if buy  is not None else "N/A"
         s_str = esc(fmt(float(sell))) if sell is not None else "N/A"
-        el    = eur_line()
-
+        el    = eur_line(cmd)
+        el_line = f"\n{el}" if el else ""
         return (
             f"*TASAS DEL DÍA*\n"
             f"📅 {esc(date_es())}\n"
             f"↪️💰{flag} _{esc(name)}_\n"
             f"\n"
-            f"🇺🇸 Dólar Compra: \\$ {b_str}\n"
-            f"🇺🇸 Dólar Venta:  \\$ {s_str}\n"
-            f"{el}\n"
+            f"🇺🇸 Dólar Compra: {b_str}\n"
+            f"🇺🇸 Dólar Venta:  {s_str}"
+            f"{el_line}\n"
             f"\n"
             f"`[ℹ️]` _Para convertir '{esc(iso)}' a otra moneda, utilizar:_ "
             f"/convertir \\[valor\\] {cmd} to \\[moneda destino\\]"
@@ -498,37 +554,37 @@ def build_rate_msg(cmd: str) -> str:
 
     # ── /cup — BCC Segmento III ───────────────────────────────────────────────
     if cmd == "cup":
-        rate = cache["cup_bcc"] or cache["rates"].get("CUP")
+        rate = cache.get("cup_bcc") or cache["rates"].get("CUP")
         rate_str = esc(fmt(rate)) if rate else "N/A"
-        el = eur_line()
+        el = eur_line("cup")
+        el_line = f"\n{el}" if el else ""
         return (
             f"*TASAS DEL DÍA*\n"
             f"📅 {esc(date_es())}\n"
             f"↪️💰{flag} _{esc(name)}_\n"
             f"\n"
-            f"🇺🇸 Dólar: 🇨🇺 {rate_str} CUP\n"
-            f"{el}\n"
+            f"🇺🇸 Dólar: {rate_str}"
+            f"{el_line}\n"
             f"\n"
-            f"`[ℹ️]` _Fuente: BCC Segmento III \\(tasa oficial\\)_\n"
-            f"_Para convertir 'CUP' a otra moneda, utilizar:_ "
+            f"`[ℹ️]` _Para convertir 'CUP' a otra moneda, utilizar:_ "
             f"/convertir \\[valor\\] cup to \\[moneda destino\\]"
         )
 
     # ── /cupb — elTOQUE mercado informal ─────────────────────────────────────
     if cmd == "cupb":
-        rate = cache["cup_informal"]
+        rate = cache.get("cup_informal")
         rate_str = esc(fmt(rate)) if rate else "N/A"
-        el = eur_line()
+        el = eur_line("cupb")
+        el_line = f"\n{el}" if el else ""
         return (
             f"*TASAS DEL DÍA*\n"
             f"📅 {esc(date_es())}\n"
             f"↪️💰{flag} _{esc(name)}_\n"
             f"\n"
-            f"🇺🇸 Dólar: 🇨🇺 {rate_str} CUP\n"
-            f"{el}\n"
+            f"🇺🇸 Dólar: {rate_str}"
+            f"{el_line}\n"
             f"\n"
-            f"`[ℹ️]` _Fuente: elTOQUE \\(mercado informal\\)_\n"
-            f"_Para convertir 'CUP' a otra moneda, utilizar:_ "
+            f"`[ℹ️]` _Para convertir 'CUP' a otra moneda, utilizar:_ "
             f"/convertir \\[valor\\] cupb to \\[moneda destino\\]"
         )
 
@@ -537,30 +593,16 @@ def build_rate_msg(cmd: str) -> str:
     if rate is None:
         return f"⚠️ No hay datos para *{esc(iso)}* hoy\\."
 
-    el = eur_line()
-
-    # Para EUR, mostramos cuánto vale en USD en lugar de la línea EUR duplicada
-    if cmd == "eur":
-        usd_per_eur = 1.0 / rate if rate else None
-        return (
-            f"*TASAS DEL DÍA*\n"
-            f"📅 {esc(date_es())}\n"
-            f"↪️💰{flag} _{esc(name)}_\n"
-            f"\n"
-            f"🇺🇸 Dólar: {flag} {esc(fmt(rate))} EUR por USD\n"
-            f"🇺🇸 1 EUR \\= {esc(fmt(usd_per_eur if usd_per_eur else 0))} USD\n"
-            f"\n"
-            f"`[ℹ️]` _Para convertir 'EUR' a otra moneda, utilizar:_ "
-            f"/convertir \\[valor\\] eur to \\[moneda destino\\]"
-        )
+    el = eur_line(cmd)
+    el_line = f"\n{el}" if el else ""
 
     return (
         f"*TASAS DEL DÍA*\n"
         f"📅 {esc(date_es())}\n"
         f"↪️💰{flag} _{esc(name)}_\n"
         f"\n"
-        f"🇺🇸 Dólar: {flag} {esc(fmt(rate))}\n"
-        f"{el}\n"
+        f"🇺🇸 Dólar: {esc(fmt(rate))}"
+        f"{el_line}\n"
         f"\n"
         f"`[ℹ️]` _Para convertir '{esc(iso)}' a otra moneda, utilizar:_ "
         f"/convertir \\[valor\\] {cmd} to \\[moneda destino\\]"
